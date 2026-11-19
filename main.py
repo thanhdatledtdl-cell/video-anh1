@@ -23,7 +23,7 @@ import anh_video
 # ==== CẤU HÌNH CHUNG ====
 # ID Google Sheet: là đoạn giữa /d/ và /edit trong địa chỉ Sheet.
 # Workflow (run.yml) tự truyền ID từ Apps Script qua biến SHEET_ID; nếu chạy tay thì dùng giá trị dưới đây.
-SHEET_ID = os.environ.get("SHEET_ID", "").strip() or "DAN_ID_SHEET_MOI_VAO_DAY"
+SHEET_ID = os.environ.get("SHEET_ID", "").strip() or "1EA0gsJYFutOI-UXgEdIhvwx90qdB1qGluq6ukUEXqXA"
 # Thư mục gốc chứa video đầu ra: tự lấy từ tab CONFIG (khoá DRIVE_OUTPUT_FOLDER_ID, do Apps Script tạo).
 # Chỉ dùng giá trị này khi tab CONFIG không có.
 DRIVE_OUTPUT_FOLDER_ID = ""
