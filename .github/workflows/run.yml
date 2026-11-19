@@ -1,56 +1,47 @@
-name: Auto Video Pipeline
+name: Dung video anh
+
 on:
-  workflow_dispatch:
+  # Apps Script gui su kien nay khi bam "Chay dung video" (hoac tick o H1)
   repository_dispatch:
     types: [new-video-row]
+  # Cho phep bam chay tay: tab Actions > Dung video anh > Run workflow
+  workflow_dispatch:
 
-# Chỉ chạy 1 lần tại 1 thời điểm, các lần khác xếp hàng chờ
+# Chi chay 1 lan tai 1 thoi diem. Cac lan gui them se xep hang cho (GitHub chi giu 1 lan dang cho),
+# main.py luon quet het cac dong chua Done nen khong sot dong nao.
 concurrency:
-  group: video
+  group: dung-video
   cancel-in-progress: false
 
 jobs:
-  run-pipeline:
-    runs-on: ubuntu-24.04
+  build:
+    runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Cai Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cai FFmpeg va Font
+      - name: Cai ffmpeg va font
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu espeak-ng
-          sudo fc-cache -f
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
 
-      - name: Cai thu vien Python (luon ban moi nhat de tranh loi 403 edge-tts)
-        run: pip install -U -r requirements.txt
+      - name: Cai thu vien Python
+        run: pip install -r requirements.txt
 
-      - name: Tai giong Piper (du phong mien phi, khong can key)
-        continue-on-error: true
-        run: |
-          mkdir -p piper_models
-          B=https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/vi/vi_VN/vais1000/medium
-          curl -L --fail --retry 3 -o piper_models/vi.onnx "$B/vi_VN-vais1000-medium.onnx"
-          curl -L --fail --retry 3 -o piper_models/vi.onnx.json "$B/vi_VN-vais1000-medium.onnx.json"
-          ls -la piper_models
-
-      - name: Tao file service_account.json tu Secret
+      - name: Tao service_account.json tu Secret
         env:
-          GCP_SA: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-        run: printf '%s' "$GCP_SA" > service_account.json
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+        run: printf '%s' "$GCP_SERVICE_ACCOUNT" > service_account.json
 
-      - name: Chay script chinh
+      - name: Chay main.py
         env:
           OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
           OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
           OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
-          AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
-          AZURE_SPEECH_REGION: ${{ secrets.AZURE_SPEECH_REGION }}
-          VIENEU: "0"
+          # Khi Apps Script gui: lay ID Sheet tu payload. Chay tay thi de trong, main.py dung SHEET_ID ghi san trong file.
+          SHEET_ID: ${{ github.event.client_payload.sheet_id }}
         run: python main.py
