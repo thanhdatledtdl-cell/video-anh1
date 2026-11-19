@@ -15,9 +15,14 @@ from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import edge_tts
 
 # ==== CẤU HÌNH CHUNG ====
-DEFAULT_SHEET_ID = os.environ.get("SHEET_ID", "").strip()
+# ID mặc định của Sheet "Làm video ảnh 1" (dùng khi bấm Run workflow trực tiếp trên GitHub)
+DEFAULT_SHEET_ID = (
+    os.environ.get("SHEET_ID", "").strip()
+    or "1EA0gsJYFutOI-UXgEdIhvwx90qdB1qGIuq6ukUEXqXA"
+)
 DEFAULT_DRIVE_OUTPUT_FOLDER_ID = os.environ.get("DRIVE_OUTPUT_FOLDER_ID", "").strip()
 
 GIONG_HOAI_MY = "vi-VN-HoaiMyNeural"
@@ -128,7 +133,7 @@ def khoi_tao():
     if cp.get("sheet_id"):
         SHEET_ID = str(cp["sheet_id"]).strip()
     if not SHEET_ID:
-        raise RuntimeError("Thiếu SHEET_ID (trong client_payload hoặc biến môi trường SHEET_ID).")
+        raise RuntimeError("Thiếu SHEET_ID.")
 
     sa_creds = SACredentials.from_service_account_file("service_account.json", scopes=SCOPES)
     gc = gspread.authorize(sa_creds)
@@ -388,6 +393,8 @@ def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
             except Exception as e:
                 loi = e
                 print(f"[TTS {lan + 1}/{so_lan}] edge {voice}: {type(e).__name__}: {str(e)[:120]}", flush=True)
+                if isinstance(e, NameError):
+                    break
                 if lan < so_lan - 1:
                     time.sleep(10 * (lan + 1))
         EDGE_HONG = True
@@ -409,7 +416,7 @@ def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
         except Exception as e:
             loi = e
             VIENEU_HONG = True
-            print(f"[TTS VieNeu] {type(e).__name__}: {str(e)[:200]} -> chuyển sang Piper", flush=True)
+            print(f"[TTS VieNeu] {type(e).__name__}: {str(e)[:200]} -> bỏ qua VieNeu", flush=True)
 
     if co_piper:
         try:
@@ -419,6 +426,16 @@ def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
         except Exception as e:
             loi = e
             print(f"[TTS Piper] {type(e).__name__}: {str(e)[:200]}", flush=True)
+
+    try:
+        from gtts import gTTS
+        gTTS(text=text, lang="vi").save(audio_path)
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) >= 1000:
+            print("[TTS] dùng gTTS tiếng Việt", flush=True)
+            return uoc_luong_tu(text, audio_path)
+    except Exception as e:
+        loi = e
+        print(f"[TTS gTTS] {type(e).__name__}: {str(e)[:150]}", flush=True)
 
     raise TTSBlocked(f"mọi nguồn giọng đọc đều lỗi: {str(loi)[:120]}")
 
