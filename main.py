@@ -18,12 +18,12 @@ from googleapiclient.http import MediaFileUpload
 import edge_tts
 
 # ==== CẤU HÌNH CHUNG ====
-# ID mặc định của Sheet "Làm video ảnh 1" (dùng khi bấm Run workflow trực tiếp trên GitHub)
 DEFAULT_SHEET_ID = (
     os.environ.get("SHEET_ID", "").strip()
     or "1EA0gsJYFutOI-UXgEdIhvwx90qdB1qGIuq6ukUEXqXA"
 )
 DEFAULT_DRIVE_OUTPUT_FOLDER_ID = os.environ.get("DRIVE_OUTPUT_FOLDER_ID", "").strip()
+DEFAULT_DRIVE_OUTPUT_FOLDER_NAME = os.environ.get("DRIVE_OUTPUT_FOLDER_NAME", "Video đầu ra").strip() or "Video đầu ra"
 
 GIONG_HOAI_MY = "vi-VN-HoaiMyNeural"
 GIONG_NAM_MINH = "vi-VN-NamMinhNeural"
@@ -89,6 +89,7 @@ SCOPES = [
 gc = drive_upload = spreadsheet = None
 SHEET_ID = DEFAULT_SHEET_ID
 DRIVE_OUTPUT_FOLDER_ID = DEFAULT_DRIVE_OUTPUT_FOLDER_ID
+DRIVE_OUTPUT_FOLDER_NAME = DEFAULT_DRIVE_OUTPUT_FOLDER_NAME
 MAX_ANH = MAX_ANH_MAC_DINH
 
 
@@ -107,7 +108,7 @@ def lay_client_payload():
 
 
 def doc_cau_hinh_sheet():
-    global DRIVE_OUTPUT_FOLDER_ID, MAX_ANH
+    global DRIVE_OUTPUT_FOLDER_ID, DRIVE_OUTPUT_FOLDER_NAME, MAX_ANH
     try:
         ws = spreadsheet.worksheet("CONFIG")
         vals = ws.get_all_values()
@@ -115,16 +116,35 @@ def doc_cau_hinh_sheet():
         for r in vals:
             if len(r) >= 2 and r[0].strip():
                 cfg[r[0].strip()] = r[1].strip()
-        if cfg.get("DRIVE_OUTPUT_FOLDER_ID"):
+        if "DRIVE_OUTPUT_FOLDER_ID" in cfg:
             DRIVE_OUTPUT_FOLDER_ID = cfg["DRIVE_OUTPUT_FOLDER_ID"]
+        if cfg.get("DRIVE_OUTPUT_FOLDER_NAME"):
+            DRIVE_OUTPUT_FOLDER_NAME = cfg["DRIVE_OUTPUT_FOLDER_NAME"]
         if cfg.get("MAX_ANH"):
             try:
                 MAX_ANH = max(1, min(10, int(cfg["MAX_ANH"])))
             except ValueError:
                 MAX_ANH = MAX_ANH_MAC_DINH
-        print(f"[CONFIG] Đã đọc cấu hình | FOLDER_ID={DRIVE_OUTPUT_FOLDER_ID or '(tự tạo)'} | MAX_ANH={MAX_ANH}", flush=True)
+        print(
+            f"[CONFIG] FOLDER_ID={DRIVE_OUTPUT_FOLDER_ID or '(tự tạo)'} | "
+            f"FOLDER_NAME={DRIVE_OUTPUT_FOLDER_NAME} | MAX_ANH={MAX_ANH}",
+            flush=True,
+        )
     except gspread.WorksheetNotFound:
         print("[CONFIG] Không có tab CONFIG, dùng cấu hình mặc định.", flush=True)
+
+
+def ghi_folder_id_vao_config(folder_id):
+    try:
+        ws_cfg = spreadsheet.worksheet("CONFIG")
+        vals = ws_cfg.get_all_values()
+        for idx, r in enumerate(vals, start=1):
+            if r and r[0].strip() == "DRIVE_OUTPUT_FOLDER_ID":
+                ws_cfg.update_cell(idx, 2, folder_id)
+                return
+        ws_cfg.append_row(["DRIVE_OUTPUT_FOLDER_ID", folder_id, "Tự tạo theo tài khoản OAuth"])
+    except Exception as e:
+        print(f"[CONFIG] Không ghi được DRIVE_OUTPUT_FOLDER_ID: {e}", flush=True)
 
 
 def khoi_tao():
@@ -150,21 +170,20 @@ def khoi_tao():
     spreadsheet = gc.open_by_key(SHEET_ID)
     doc_cau_hinh_sheet()
 
-    if not DRIVE_OUTPUT_FOLDER_ID:
-        DRIVE_OUTPUT_FOLDER_ID = retry(tim_hoac_tao_thu_muc, "Video đầu ra", "root", drive_upload)
+    if DRIVE_OUTPUT_FOLDER_ID:
         try:
-            ws_cfg = spreadsheet.worksheet("CONFIG")
-            vals = ws_cfg.get_all_values()
-            updated = False
-            for idx, r in enumerate(vals, start=1):
-                if r and r[0].strip() == "DRIVE_OUTPUT_FOLDER_ID":
-                    ws_cfg.update_cell(idx, 2, DRIVE_OUTPUT_FOLDER_ID)
-                    updated = True
-                    break
-            if not updated:
-                ws_cfg.append_row(["DRIVE_OUTPUT_FOLDER_ID", DRIVE_OUTPUT_FOLDER_ID, "Tự tạo"])
+            drive_upload.files().get(fileId=DRIVE_OUTPUT_FOLDER_ID, fields="id").execute()
         except Exception:
-            pass
+            raise RuntimeError(
+                f"Tài khoản OAuth không truy cập được thư mục {DRIVE_OUTPUT_FOLDER_ID}. "
+                "Hãy xoá trắng DRIVE_OUTPUT_FOLDER_ID trong tab CONFIG hoặc chia sẻ thư mục cho tài khoản OAuth."
+            )
+    else:
+        DRIVE_OUTPUT_FOLDER_ID = retry(
+            tim_hoac_tao_thu_muc, DRIVE_OUTPUT_FOLDER_NAME, "root", drive_upload
+        )
+        ghi_folder_id_vao_config(DRIVE_OUTPUT_FOLDER_ID)
+        print(f"[DRIVE] Đã sẵn sàng thư mục '{DRIVE_OUTPUT_FOLDER_NAME}' (ID={DRIVE_OUTPUT_FOLDER_ID})", flush=True)
 
 
 # ================== TIỆN ÍCH ==================
@@ -212,9 +231,11 @@ def get_duration(path):
 
 
 def tim_folder(ten, parent_id, service):
-    q = (f"name = '{ten.replace(chr(39), chr(92) + chr(39))}' "
-         f"and mimeType = 'application/vnd.google-apps.folder' "
-         f"and '{parent_id}' in parents and trashed = false")
+    q = (
+        f"name = '{ten.replace(chr(39), chr(92) + chr(39))}' "
+        f"and mimeType = 'application/vnd.google-apps.folder' "
+        f"and '{parent_id}' in parents and trashed = false"
+    )
     files = service.files().list(q=q, fields="files(id)").execute().get("files", [])
     return files[0]["id"] if files else None
 
@@ -291,8 +312,10 @@ async def _edge_tts(text, audio_path, voice):
 
 
 def tao_giong_azure(text, audio_path, voice):
-    ssml = ("<speak version='1.0' xml:lang='vi-VN'><voice name='%s'>%s</voice></speak>"
-            % (voice, xml_escape(text)))
+    ssml = (
+        "<speak version='1.0' xml:lang='vi-VN'><voice name='%s'>%s</voice></speak>"
+        % (voice, xml_escape(text))
+    )
     req = urllib.request.Request(
         f"https://{AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
         data=ssml.encode("utf-8"),
