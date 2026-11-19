@@ -3,8 +3,6 @@ import re
 import sys
 import json
 import time
-import random
-import unicodedata
 import asyncio
 import subprocess
 import urllib.request
@@ -16,84 +14,63 @@ import gspread
 from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-import edge_tts
-import anh_video
+from googleapiclient.http import MediaFileUpload
 
 # ==== CẤU HÌNH CHUNG ====
-# ID Google Sheet: là đoạn giữa /d/ và /edit trong địa chỉ Sheet.
-# Workflow (run.yml) tự truyền ID từ Apps Script qua biến SHEET_ID; nếu chạy tay thì dùng giá trị dưới đây.
-SHEET_ID = os.environ.get("SHEET_ID", "").strip() or "1EA0gsJYFutOI-UXgEdIhvwx90qdB1qGluq6ukUEXqXA"
-# Thư mục gốc chứa video đầu ra: tự lấy từ tab CONFIG (khoá DRIVE_OUTPUT_FOLDER_ID, do Apps Script tạo).
-# Chỉ dùng giá trị này khi tab CONFIG không có.
-DRIVE_OUTPUT_FOLDER_ID = ""
-NGUON_VIDEO_NEN_ROOT_ID = "1q8dWz0BvylzeN8hD5AyeX0_2Rs-Zmfrm"   # chỉ dùng cho kiểu video nền cũ, video ảnh không dùng
+DEFAULT_SHEET_ID = os.environ.get("SHEET_ID", "").strip()
+DEFAULT_DRIVE_OUTPUT_FOLDER_ID = os.environ.get("DRIVE_OUTPUT_FOLDER_ID", "").strip()
 
-# Giọng đọc (đều là edge-tts nên phụ đề vẫn khớp từng từ). Mỗi loại video có giọng riêng,
-# giọng còn lại là dự phòng. Muốn đổi giọng: sửa mục "voices" của từng tab bên dưới.
-GIONG_HOAI_MY = "vi-VN-HoaiMyNeural"   # nữ
-GIONG_NAM_MINH = "vi-VN-NamMinhNeural"  # nam
+GIONG_HOAI_MY = "vi-VN-HoaiMyNeural"
+GIONG_NAM_MINH = "vi-VN-NamMinhNeural"
 SO_LAN_THU_TTS = 3
-# Dự phòng chính thức (tuỳ chọn): Azure Speech - cùng giọng HoaiMy/NamMinh. Chỉ dùng khi có Secret
-# AZURE_SPEECH_KEY và AZURE_SPEECH_REGION (ví dụ southeastasia). Không có thì bỏ qua.
+
 AZURE_KEY = os.environ.get("AZURE_SPEECH_KEY", "").strip()
 AZURE_REGION = os.environ.get("AZURE_SPEECH_REGION", "").strip()
-# Dự phòng MIỄN PHÍ, không cần đăng ký/key: Piper (chạy ngay trên máy chủ GitHub, giọng tiếng Việt vais1000).
-# Workflow tải sẵn model vào thư mục piper_models/. Không có file model thì bỏ qua.
 PIPER_MODEL = "piper_models/vi.onnx"
-# VieNeu-TTS (giọng AI tiếng Việt, chạy CPU, miễn phí, không cần key). Tải model từ Hugging Face ở lần dùng đầu.
-# Đặt biến môi trường VIENEU=0 để tắt. VIENEU_PRECISION: "fp32" (mặc định, an toàn) hoặc "int8" (nhanh hơn, cần CPU hỗ trợ).
+
 VIENEU_BAT = os.environ.get("VIENEU", "1") != "0"
 VIENEU_PRECISION = os.environ.get("VIENEU_PRECISION", "fp32")
 _vieneu = None
 VIENEU_HONG = False
-EDGE_HONG = False   # sau khi edge-tts hỏng 1 video, bỏ qua edge-tts cho các video còn lại của lần chạy này
-GIAN_CACH_TTS_GIAY = 2  # nghỉ ngắn trước mỗi lần gọi TTS cho đỡ bị Microsoft giới hạn tần suất
+EDGE_HONG = False
+GIAN_CACH_TTS_GIAY = 2
+
 LOGO_PATH = "logo.png"
 TEXT_LIEN_HE = "Thành Đạt Led - 0986474671 -  0867933396"
-TEXT_SDT = "0986474671 -  0867933396"   # video ngắn: tên shop nằm dòng riêng nên dòng này chỉ có số
-MAU_CHU = "#FF8A00"   # màu cam dùng chung cho chữ tên và dòng liên hệ
-SO_VIDEO_NEN_MOI_LAN = (2, 3)
+TEXT_SDT = "0986474671 -  0867933396"
+MAU_CHU = "#FF8A00"
 THOI_GIAN_HIEN_TOI_THIEU_GIAY = 1.8
 FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-# Sau chừng này phút thì không bắt đầu video mới nữa (lần chạy sau làm tiếp). Workflow timeout = 350.
-# (có thể ghi đè bằng khoá GIOI_HAN_PHUT trong tab CONFIG)
 GIOI_HAN_PHUT = 300
-# 0 = không giới hạn (có thể ghi đè bằng khoá MAX_VIDEO trong tab CONFIG)
 MAX_VIDEO = int(os.environ.get("MAX_VIDEO", "0") or 0)
+MAX_ANH_MAC_DINH = 5
 
 DONE = ("done", "hoàn thành", "hoan thanh")
+S_NGAN = 720 / 1080
 
-S_NGAN = 720 / 1080   # hệ số co từ mẫu 1080x1920 sang 720x1280
-
-# Hai tab dùng ẢNH: link ảnh nằm ở cột D (mỗi ô 1-5 link, cách nhau bằng xuống dòng/dấu cách/dấu phẩy)
-TAB_ANH_COT_D = ("lam_video_dai", "lam_video_ngan")
-
-# ==== MỖI TAB = 1 KIỂU VIDEO (thứ tự ở đây = thứ tự xen kẽ: dài, ngắn, dài, ngắn...) ====
-# Cột cố định: A TieuDe, B NoiDung, C LoaiDen, D LinkAnh, E LinkDrive, F Status, I Log
+# ==== MỖI TAB = 1 KIỂU VIDEO & THƯ MỤC RIÊNG TRÊN DRIVE ====
 PROFILES = {
-    "lam_video_dai": dict(   # NGANG 16:9
-        kieu="anh",
-        W=1280, H=720, thu_muc="Video Dai",
+    "lam_video_dai": dict(
+        W=1280, H=720,
+        thu_muc_goc="Video Dai",
         voices=[GIONG_HOAI_MY, GIONG_NAM_MINH],
-        vieneu_voice="Trúc Ly",      # nữ, Bắc, tự nhiên
-        logo_giua=False,             # logo ở góc phải
+        vieneu_voice="Trúc Ly",
+        logo_giua=False,
         logo_w=200, logo_y=20,
         contact_size=32, contact_y=50,
         sub_size=34, sub_margin_v=55, sub_margin_lr=80,
         so_tu_cum=11,
     ),
-    "lam_video_ngan": dict(  # DỌC 9:16 theo đúng mẫu SHORTS: video ngang ở giữa + nền mờ trên/dưới
-        kieu="anh",
-        W=720, H=1280, thu_muc="Video Ngan",      # đổi thành W=1080, H=1920 để ra đúng kích thước mẫu
+    "lam_video_ngan": dict(
+        W=720, H=1280,
+        thu_muc_goc="Video Ngan",
         voices=[GIONG_NAM_MINH, GIONG_HOAI_MY],
-        vieneu_voice="Hải Đăng",     # nam, Bắc, tự nhiên
+        vieneu_voice="Hải Đăng",
         khung_mo=True,
-        nen_w=1280, nen_h=720,       # video nền dựng ngang 16:9 rồi đặt vào giữa khung dọc
+        nen_w=1280, nen_h=720,
         ten_text="Thành Đạt LED", lien_he_text=TEXT_SDT,
         mau_ten="white", mau_sdt="#FFD500",
-        # phụ đề theo mẫu: cỡ 44, lề 60, MarginV 650, 11 từ/cụm (số đo gốc 1080x1920, co theo W)
         sub_size=round(44 * S_NGAN), sub_margin_v=round(650 * S_NGAN), sub_margin_lr=round(60 * S_NGAN),
         so_tu_cum=11,
     ),
@@ -104,16 +81,57 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-gc = drive_read = drive_upload = spreadsheet = None
+gc = drive_upload = spreadsheet = None
+SHEET_ID = DEFAULT_SHEET_ID
+DRIVE_OUTPUT_FOLDER_ID = DEFAULT_DRIVE_OUTPUT_FOLDER_ID
+MAX_ANH = MAX_ANH_MAC_DINH
+
+
+def lay_client_payload():
+    p_path = os.environ.get("GITHUB_EVENT_PATH", "").strip()
+    if p_path and os.path.exists(p_path):
+        try:
+            with open(p_path, "r", encoding="utf-8") as f:
+                ev = json.load(f)
+            cp = ev.get("client_payload") or {}
+            if isinstance(cp, dict):
+                return cp
+        except Exception:
+            pass
+    return {}
+
+
+def doc_cau_hinh_sheet():
+    global DRIVE_OUTPUT_FOLDER_ID, MAX_ANH
+    try:
+        ws = spreadsheet.worksheet("CONFIG")
+        vals = ws.get_all_values()
+        cfg = {}
+        for r in vals:
+            if len(r) >= 2 and r[0].strip():
+                cfg[r[0].strip()] = r[1].strip()
+        if cfg.get("DRIVE_OUTPUT_FOLDER_ID"):
+            DRIVE_OUTPUT_FOLDER_ID = cfg["DRIVE_OUTPUT_FOLDER_ID"]
+        if cfg.get("MAX_ANH"):
+            try:
+                MAX_ANH = max(1, min(10, int(cfg["MAX_ANH"])))
+            except ValueError:
+                MAX_ANH = MAX_ANH_MAC_DINH
+        print(f"[CONFIG] Đã đọc cấu hình | FOLDER_ID={DRIVE_OUTPUT_FOLDER_ID or '(tự tạo)'} | MAX_ANH={MAX_ANH}", flush=True)
+    except gspread.WorksheetNotFound:
+        print("[CONFIG] Không có tab CONFIG, dùng cấu hình mặc định.", flush=True)
 
 
 def khoi_tao():
-    global gc, drive_read, drive_upload, spreadsheet
-    if SHEET_ID.startswith("DAN_ID"):
-        raise RuntimeError("Chưa điền SHEET_ID trong main.py (dòng SHEET_ID = ...). Dán ID Google Sheet mới vào.")
+    global gc, drive_upload, spreadsheet, SHEET_ID, DRIVE_OUTPUT_FOLDER_ID
+    cp = lay_client_payload()
+    if cp.get("sheet_id"):
+        SHEET_ID = str(cp["sheet_id"]).strip()
+    if not SHEET_ID:
+        raise RuntimeError("Thiếu SHEET_ID (trong client_payload hoặc biến môi trường SHEET_ID).")
+
     sa_creds = SACredentials.from_service_account_file("service_account.json", scopes=SCOPES)
     gc = gspread.authorize(sa_creds)
-    drive_read = build("drive", "v3", credentials=sa_creds)
 
     oauth_creds = OAuthCredentials(
         token=None,
@@ -125,16 +143,32 @@ def khoi_tao():
     )
     drive_upload = build("drive", "v3", credentials=oauth_creds)
     spreadsheet = gc.open_by_key(SHEET_ID)
+    doc_cau_hinh_sheet()
+
+    if not DRIVE_OUTPUT_FOLDER_ID:
+        DRIVE_OUTPUT_FOLDER_ID = retry(tim_hoac_tao_thu_muc, "Video đầu ra", "root", drive_upload)
+        try:
+            ws_cfg = spreadsheet.worksheet("CONFIG")
+            vals = ws_cfg.get_all_values()
+            updated = False
+            for idx, r in enumerate(vals, start=1):
+                if r and r[0].strip() == "DRIVE_OUTPUT_FOLDER_ID":
+                    ws_cfg.update_cell(idx, 2, DRIVE_OUTPUT_FOLDER_ID)
+                    updated = True
+                    break
+            if not updated:
+                ws_cfg.append_row(["DRIVE_OUTPUT_FOLDER_ID", DRIVE_OUTPUT_FOLDER_ID, "Tự tạo"])
+        except Exception:
+            pass
 
 
 # ================== TIỆN ÍCH ==================
 
 class TTSBlocked(Exception):
-    """edge-tts (cả 2 giọng) đều không tạo được giọng đọc."""
+    """Mọi nguồn giọng đọc đều không tạo được âm thanh."""
 
 
 def retry(fn, *args, tries=5, **kwargs):
-    """Gọi Google API, lỗi tạm thời (429/500/503/mạng) thì đợi rồi thử lại."""
     for lan in range(tries):
         try:
             return fn(*args, **kwargs)
@@ -147,7 +181,6 @@ def retry(fn, *args, tries=5, **kwargs):
 
 
 def ghi_log(ws, i, msg):
-    """Ghi lỗi: cột F = '❌ Lỗi' (để menu 'Chạy lại các dòng lỗi' nhận ra) và cột I = nội dung lỗi."""
     try:
         retry(ws.batch_update, [
             {"range": f"F{i}", "values": [["❌ Lỗi"]]},
@@ -158,61 +191,11 @@ def ghi_log(ws, i, msg):
 
 
 def slugify_vi(text):
+    import unicodedata
     text = text.lower().replace("đ", "d")
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return re.sub(r"[^a-z0-9]+", "-", text).strip("-") or "video"
-
-
-def ten_file_video(tieu_de):
-    """Tên file video = tiêu đề (bỏ ký tự cấm), giống hàm tenFile_ bên Apps Script."""
-    t = re.sub(r'[\\/:*?"<>|]+', " ", tieu_de or "")
-    t = re.sub(r"\s+", " ", t).strip()[:100]
-    return (t or "video") + ".mp4"
-
-
-def tach_link_o(o, toi_da=5):
-    """Tách 1 ô chứa nhiều link (xuống dòng / dấu cách / dấu phẩy / chấm phẩy) thành danh sách link."""
-    thay, kq = set(), []
-    for x in re.split(r"[\s,;]+", o or ""):
-        if re.match(r"^https?://", x, re.I) and x not in thay:
-            thay.add(x)
-            kq.append(x)
-    return kq[:toi_da]
-
-
-_cau_hinh_sheet = None
-
-
-def lay_cau_hinh_sheet(key):
-    """Đọc 1 giá trị trong tab CONFIG của Google Sheet (cột A = khoá, cột B = giá trị)."""
-    global _cau_hinh_sheet
-    if _cau_hinh_sheet is None:
-        _cau_hinh_sheet = {}
-        try:
-            for r in retry(spreadsheet.worksheet("CONFIG").get_all_values):
-                if len(r) >= 2 and r[0].strip():
-                    _cau_hinh_sheet[r[0].strip()] = r[1].strip()
-        except gspread.WorksheetNotFound:
-            pass
-    return _cau_hinh_sheet.get(key, "")
-
-
-_goc_id = None
-
-
-def lay_thu_muc_goc():
-    """ID thư mục gốc chứa video đầu ra (ưu tiên tab CONFIG)."""
-    global _goc_id
-    if _goc_id:
-        return _goc_id
-    fid = (lay_cau_hinh_sheet("DRIVE_OUTPUT_FOLDER_ID")
-           or os.environ.get("DRIVE_OUTPUT_FOLDER_ID", "").strip()
-           or DRIVE_OUTPUT_FOLDER_ID)
-    if not fid:
-        raise RuntimeError("Chưa có DRIVE_OUTPUT_FOLDER_ID. Chạy menu 'Cài đặt tự động' trong Google Sheet để tạo thư mục.")
-    _goc_id = fid
-    return fid
 
 
 def get_duration(path):
@@ -239,23 +222,36 @@ def tim_hoac_tao_thu_muc(ten, parent_id, service):
     return service.files().create(body=meta, fields="id").execute()["id"]
 
 
-def lay_danh_sach_video(folder_id):
-    return drive_read.files().list(
-        q=f"'{folder_id}' in parents and mimeType contains 'video/' and trashed = false",
-        fields="files(id, name)",
-    ).execute().get("files", [])
+def tach_link_anh(raw_links):
+    if not raw_links:
+        return []
+    parts = re.split(r"[\s,;]+", str(raw_links).strip())
+    out, seen = [], set()
+    for p in parts:
+        p = p.strip()
+        if p.startswith(("http://", "https://")) and p not in seen:
+            seen.add(p)
+            out.append(p)
+            if len(out) >= MAX_ANH:
+                break
+    return out
 
 
-def tai_video_ve(file_id, out_path):
-    req = drive_read.files().get_media(fileId=file_id)
-    with open(out_path, "wb") as f:
-        dl = MediaIoBaseDownload(f, req)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
+def tai_anh_ve(url, out_path):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp, open(out_path, "wb") as f:
+        f.write(resp.read())
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 500:
+        raise RuntimeError(f"Ảnh tải về rỗng hoặc lỗi: {url}")
 
 
-# ================== GIỌNG ĐỌC (edge-tts, 2 giọng luân phiên) + PHỤ ĐỀ ==================
+# ================== GIỌNG ĐỌC + PHỤ ĐỀ ==================
 
 def giay_sang_ass_time(sec):
     h, m, s = int(sec // 3600), int((sec % 3600) // 60), int(sec % 60)
@@ -263,7 +259,6 @@ def giay_sang_ass_time(sec):
 
 
 def uoc_luong_tu(text, audio_path):
-    """Không có mốc thời gian từng từ -> chia đều theo độ dài chữ trên tổng thời lượng audio."""
     dur = get_duration(audio_path)
     tu = text.split()
     if not tu:
@@ -291,7 +286,6 @@ async def _edge_tts(text, audio_path, voice):
 
 
 def tao_giong_azure(text, audio_path, voice):
-    """Azure Speech (REST). Không có mốc thời gian từng từ -> phụ đề ước lượng theo độ dài chữ."""
     ssml = ("<speak version='1.0' xml:lang='vi-VN'><voice name='%s'>%s</voice></speak>"
             % (voice, xml_escape(text)))
     req = urllib.request.Request(
@@ -316,7 +310,6 @@ def tao_giong_azure(text, audio_path, voice):
 
 
 def tao_giong_vieneu(text, audio_path, voice_name):
-    """VieNeu-TTS v3 Turbo (CPU/ONNX). Không có mốc từng từ -> phụ đề ước lượng theo độ dài chữ."""
     global _vieneu
     if _vieneu is None:
         from vieneu import Vieneu
@@ -345,7 +338,6 @@ def tao_giong_vieneu(text, audio_path, voice_name):
 
 
 def tao_giong_piper(text, audio_path):
-    """Piper (offline, miễn phí). Không có mốc từng từ -> phụ đề ước lượng theo độ dài chữ."""
     if not os.path.exists(PIPER_MODEL):
         raise RuntimeError("chưa có model Piper")
     base = audio_path.rsplit(".", 1)[0]
@@ -375,9 +367,6 @@ def tao_giong_piper(text, audio_path):
 
 
 def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
-    """Trả về danh sách (bắt đầu, kết thúc, từ). Thứ tự ưu tiên:
-    1) edge-tts (phụ đề khớp từng từ). Hỏng thì đánh dấu EDGE_HONG, các video sau khỏi thử lại.
-    2) Azure Speech (nếu có key).  3) VieNeu-TTS (miễn phí, CPU).  4) Piper (miễn phí, offline).  5) Không được thì TTSBlocked."""
     global EDGE_HONG, VIENEU_HONG
     co_azure = bool(AZURE_KEY and AZURE_REGION)
     co_piper = os.path.exists(PIPER_MODEL)
@@ -394,7 +383,6 @@ def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
                 if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
                     raise RuntimeError("audio rỗng")
                 if not words:
-                    print("[TTS] không có mốc từ, ước lượng thời gian phụ đề.", flush=True)
                     words = uoc_luong_tu(text, audio_path)
                 return words
             except Exception as e:
@@ -403,7 +391,7 @@ def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
                 if lan < so_lan - 1:
                     time.sleep(10 * (lan + 1))
         EDGE_HONG = True
-        print("[TTS] edge-tts đang hỏng, các video còn lại trong lần chạy này sẽ bỏ qua edge-tts.", flush=True)
+        print("[TTS] edge-tts đang hỏng, các video sau bỏ qua edge-tts.", flush=True)
 
     if co_azure:
         for voice in voices:
@@ -417,11 +405,10 @@ def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
 
     if co_vieneu:
         try:
-            words = tao_giong_vieneu(text, audio_path, vieneu_voice)
-            return words
+            return tao_giong_vieneu(text, audio_path, vieneu_voice)
         except Exception as e:
             loi = e
-            VIENEU_HONG = True   # lỗi 1 lần thì các video sau khỏi thử lại, chuyển thẳng sang Piper
+            VIENEU_HONG = True
             print(f"[TTS VieNeu] {type(e).__name__}: {str(e)[:200]} -> chuyển sang Piper", flush=True)
 
     if co_piper:
@@ -433,7 +420,7 @@ def tao_giong_doc(text, audio_path, voices, vieneu_voice="Hải Đăng"):
             loi = e
             print(f"[TTS Piper] {type(e).__name__}: {str(e)[:200]}", flush=True)
 
-    raise TTSBlocked(f"mọi nguồn giọng đọc đều lỗi (azure={co_azure}, vieneu={co_vieneu}, piper={co_piper}): {str(loi)[:120]}")
+    raise TTSBlocked(f"mọi nguồn giọng đọc đều lỗi: {str(loi)[:120]}")
 
 
 def viet_phu_de(words, ass_path, P):
@@ -469,50 +456,42 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     print(f"[DEBUG] {len(words)} từ, {len(cums)} cụm phụ đề", flush=True)
 
 
-# ================== VIDEO NỀN (kiểu cũ, video ảnh không dùng) ==================
+# ================== DỰNG VIDEO NỀN TỪ DANH SÁCH ẢNH ==================
 
-def chuan_bi_video_nen(folder_id, audio_duration, i, P):
-    goc = lay_danh_sach_video(folder_id)
-    if not goc:
-        return None
+def chuan_bi_video_nen_tu_anh(links, audio_duration, tag, P):
     W, H = P.get("nen_w", P["W"]), P.get("nen_h", P["H"])
-
-    so_luong = min(random.randint(*SO_VIDEO_NEN_MOI_LAN), len(goc))
-    chon = random.sample(goc, so_luong)
-    random.shuffle(chon)
-
-    paths, total = [], 0.0
-
-    def tai(video):
-        nonlocal total
-        p = f"bgsrc_{i}_{len(paths)}.mp4"
-        tai_video_ve(video["id"], p)
-        paths.append(p)
-        total += get_duration(p)
-
+    img_paths = []
     try:
-        for v in chon:
-            tai(v)
-        while total < audio_duration + 2 and len(paths) <= 40:
-            tai(random.choice(goc))
+        for idx, url in enumerate(links):
+            p = f"img_{tag}_{idx}"
+            tai_anh_ve(url, p)
+            img_paths.append(p)
 
-        # scale + crop để lấp đầy khung (ngang hay dọc đều không bị méo/viền đen)
-        parts = [
-            f"[{j}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30[v{j}]"
-            for j in range(len(paths))
-        ]
-        parts.append("".join(f"[v{j}]" for j in range(len(paths))) + f"concat=n={len(paths)}:v=1:a=0[bgv]")
+        n = len(img_paths)
+        dur_moi_anh = max(2.0, audio_duration / n)
+        total_dur = dur_moi_anh * n
+        while total_dur < audio_duration + 1.0:
+            dur_moi_anh += 0.5
+            total_dur = dur_moi_anh * n
 
-        out = f"bgconcat_{i}.mp4"
+        parts = []
+        for j in range(n):
+            parts.append(
+                f"[{j}:v]loop=loop=-1:size=1:start=0,trim=duration={dur_moi_anh:.3f},setpts=PTS-STARTPTS,"
+                f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30[v{j}]"
+            )
+        parts.append("".join(f"[v{j}]" for j in range(n)) + f"concat=n={n}:v=1:a=0[bgv]")
+
+        out = f"bgimg_{tag}.mp4"
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-        for p in paths:
+        for p in img_paths:
             cmd += ["-i", p]
         cmd += ["-filter_complex", ";".join(parts), "-map", "[bgv]", "-an",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out]
         subprocess.run(cmd, check=True)
         return out
     finally:
-        for p in paths:
+        for p in img_paths:
             if os.path.exists(p):
                 os.remove(p)
 
@@ -520,15 +499,13 @@ def chuan_bi_video_nen(folder_id, audio_duration, i, P):
 # ================== GHÉP CUỐI ==================
 
 def filter_video_ngan(P, ass_esc):
-    """Đúng mẫu SHORTS (số đo gốc cho 1080x1920, tự co theo W): video ngang giữ tỉ lệ ở giữa,
-    nền là chính video phóng to + làm mờ; logo giữa; dòng 1 tên shop (trắng); dòng 2 số điện thoại (vàng)."""
     W, H = P["W"], P["H"]
     k = W / 1080
 
     def px(v):
         return max(1, round(v * k))
 
-    sigma = max(1.0, 25 * k / 2)   # làm mờ ở độ phân giải nửa cho nhanh, độ mờ tương đương mẫu (sigma 25 ở 1080)
+    sigma = max(1.0, 25 * k / 2)
     return (
         f"[0:v]split=2[bgsrc][fgsrc];"
         f"[bgsrc]scale={W // 2}:{H // 2}:force_original_aspect_ratio=increase,"
@@ -552,7 +529,6 @@ def filter_video_ngan(P, ass_esc):
 
 
 def filter_video_dai(P, ass_esc):
-    """Video dài (ngang): GIỮ NGUYÊN như bản gốc."""
     return (
         f"[0:v]scale={P['W']}:{P['H']}[bg];"
         f"[1:v]scale={P['logo_w']}:-1[logo];"
@@ -597,7 +573,7 @@ def upload_to_drive(file_path, file_name, parent_id):
 # ================== HÀNG ĐỢI XEN KẼ ==================
 
 def lay_viec_cho():
-    """Đọc các tab, trả về danh sách việc XEN KẼ: dài, ngắn, dài, ngắn..."""
+    """Đọc lam_video_dai và lam_video_ngan, xếp xen kẽ 1 dài - 1 ngắn."""
     theo_tab = []
     for ten_tab in PROFILES:
         try:
@@ -605,28 +581,25 @@ def lay_viec_cho():
         except gspread.WorksheetNotFound:
             print(f"Không có tab {ten_tab}, bỏ qua.", flush=True)
             continue
-        kieu_anh = PROFILES[ten_tab].get("kieu") == "anh"
         rows = retry(ws.get_all_values)
         ds = []
         for i, row in enumerate(rows[1:], start=2):
-            row = row + [""] * (16 - len(row))
-            tieu_de, text, loai_den = row[0].strip(), row[1].strip(), row[2].strip()
-            if kieu_anh:
-                loai_den = loai_den or "Chung"
-            if row[5].strip().lower() in DONE or not (tieu_de and text and loai_den):
+            row = row + [""] * (6 - len(row))
+            tieu_de = row[0].strip()
+            text = row[1].strip()
+            loai_den = row[2].strip()
+            links = tach_link_anh(row[3])
+            status = row[5].strip().lower()
+            if status in DONE:
+                continue
+            if not (tieu_de and text and loai_den and links):
                 continue
             if text == "Đang tạo nội dung...":
                 continue
-            job = dict(tab=ten_tab, ws=ws, i=i, tieu_de=tieu_de, text=text, loai_den=loai_den)
-            if kieu_anh:
-                if ten_tab in TAB_ANH_COT_D:
-                    cac_link = tach_link_o(row[3])            # cột D: LinkAnh
-                else:
-                    cac_link = row[9:14]                      # tab ảnh kiểu cũ: cột J-N
-                job["anh"] = anh_video.doc_link_anh(cac_link)
-                if not job["anh"]:
-                    continue
-            ds.append(job)
+            ds.append(dict(
+                tab=ten_tab, ws=ws, i=i,
+                tieu_de=tieu_de, text=text, loai_den=loai_den, links=links
+            ))
         print(f"[{ten_tab}] {len(ds)} video cần làm.", flush=True)
         theo_tab.append(ds)
 
@@ -638,59 +611,50 @@ def lay_viec_cho():
 
 # ================== LÀM 1 VIDEO ==================
 
-cache_nen, cache_thu_muc_out = {}, {}
+cache_thu_muc_out = {}
+
+
+def lay_thu_muc_dich_drive(ten_tab, loai_den):
+    """Tạo/lấy thư mục theo cấu trúc: [DRIVE_OUTPUT_FOLDER_ID] / [Video Dai hoặc Video Ngan] / [LoaiDen]."""
+    P = PROFILES[ten_tab]
+    loai_folder = P["thu_muc_goc"]
+    if loai_folder not in cache_thu_muc_out:
+        cache_thu_muc_out[loai_folder] = retry(
+            tim_hoac_tao_thu_muc, loai_folder, DRIVE_OUTPUT_FOLDER_ID, drive_upload
+        )
+
+    ten_loai_den = loai_den.replace("\\", "-").replace("/", "-").strip() or "Khac"
+    khoa = (loai_folder, ten_loai_den)
+    if khoa not in cache_thu_muc_out:
+        cache_thu_muc_out[khoa] = retry(
+            tim_hoac_tao_thu_muc, ten_loai_den, cache_thu_muc_out[loai_folder], drive_upload
+        )
+    return cache_thu_muc_out[khoa]
 
 
 def lam_1_video(job):
     ten_tab, ws, i = job["tab"], job["ws"], job["i"]
-    tieu_de, text, loai_den = job["tieu_de"], job["text"], job["loai_den"]
+    tieu_de, text, loai_den, links = job["tieu_de"], job["text"], job["loai_den"], job["links"]
     P = PROFILES[ten_tab]
-    kieu_anh = P.get("kieu") == "anh"
 
-    folder_id = None
-    if not kieu_anh:
-        if loai_den not in cache_nen:
-            cache_nen[loai_den] = retry(tim_folder, loai_den, NGUON_VIDEO_NEN_ROOT_ID, drive_read)
-        folder_id = cache_nen[loai_den]
-        if not folder_id:
-            cache_nen.pop(loai_den, None)
-            print(f"[{ten_tab}] Dòng {i}: không có thư mục nền '{loai_den}', bỏ qua.", flush=True)
-            ghi_log(ws, i, f"❌ Không có thư mục nền '{loai_den}'")
-            return
-
-    audio_path, ass_path, out_path = f"audio_{ten_tab}_{i}.mp3", f"caption_{ten_tab}_{i}.ass", f"output_{ten_tab}_{i}.mp4"
-    bg, chu_ky = None, ""
+    audio_path = f"audio_{ten_tab}_{i}.mp3"
+    ass_path = f"caption_{ten_tab}_{i}.ass"
+    out_path = f"output_{ten_tab}_{i}.mp4"
+    bg = None
     try:
-        voices = P["voices"]
-        if P.get("giong_ngau_nhien"):
-            voices = random.sample(voices, len(voices))
-        words = tao_giong_doc(text, audio_path, voices, P.get("vieneu_voice", "Hải Đăng"))
+        words = tao_giong_doc(text, audio_path, P["voices"], P.get("vieneu_voice", "Hải Đăng"))
         viet_phu_de(words, ass_path, P)
-        if kieu_anh:
-            bg, chu_ky = anh_video.dung_video_anh(job["anh"], get_duration(audio_path), f"{ten_tab}_{i}", P, tieu_de, spreadsheet)
-        else:
-            bg = chuan_bi_video_nen(folder_id, get_duration(audio_path), f"{ten_tab}_{i}", P)
-            if not bg:
-                print(f"[{ten_tab}] Dòng {i}: thư mục '{loai_den}' không có video, bỏ qua.", flush=True)
-                ghi_log(ws, i, f"❌ Thư mục '{loai_den}' không có video")
-                return
-
+        bg = chuan_bi_video_nen_tu_anh(links, get_duration(audio_path), f"{ten_tab}_{i}", P)
         ghep_video(audio_path, bg, ass_path, out_path, P)
 
-        # Lưu vào: [thư mục gốc] / [LoaiDen] / [TieuDe].mp4   (ví dụ: Video đầu ra / Đèn đường led / ....mp4)
-        ten_thu_muc = loai_den.replace("\\", "-").replace("/", "-").strip() or "Khac"
-        if ten_thu_muc not in cache_thu_muc_out:
-            cache_thu_muc_out[ten_thu_muc] = retry(tim_hoac_tao_thu_muc, ten_thu_muc, lay_thu_muc_goc(), drive_upload)
-        link = retry(upload_to_drive, out_path, ten_file_video(tieu_de), cache_thu_muc_out[ten_thu_muc])
+        parent_dich = lay_thu_muc_dich_drive(ten_tab, loai_den)
+        link = retry(upload_to_drive, out_path, slugify_vi(tieu_de) + ".mp4", parent_dich)
 
-        # 1 lệnh ghi duy nhất (link + Done + xoá log) để không vượt hạn mức 60 lệnh ghi/phút
         retry(ws.batch_update, [
             {"range": f"E{i}:F{i}", "values": [[link, "Done"]]},
             {"range": f"I{i}", "values": [[""]]},
         ], value_input_option="USER_ENTERED")
-        if ten_tab not in TAB_ANH_COT_D and kieu_anh:
-            anh_video.ghi_nhat_ky(spreadsheet, tieu_de, len(job["anh"]), chu_ky)
-        print(f"[{ten_tab}] Dòng {i}: xong -> {link}", flush=True)
+        print(f"[{ten_tab}] Dòng {i}: xong ({P['thu_muc_goc']}/{loai_den}) -> {link}", flush=True)
     except TTSBlocked:
         raise
     except Exception as e:
@@ -705,21 +669,14 @@ def lam_1_video(job):
 # ================== MAIN ==================
 
 def main():
-    global MAX_VIDEO, GIOI_HAN_PHUT
     bat_dau = time.time()
     try:
         ip = urllib.request.urlopen("https://api.ipify.org", timeout=10).read().decode()
         print(f"IP máy chủ GitHub lần này: {ip} | edge-tts {getattr(edge_tts, '__version__', '?')}", flush=True)
     except Exception:
         pass
+
     khoi_tao()
-    anh_video.doc_config(spreadsheet)                                   # đọc tab CONFIG
-    try:
-        anh_video.ap_cau_hinh(PROFILES, GIONG_HOAI_MY, GIONG_NAM_MINH)   # tab lam_video_anh kiểu cũ (nếu có trong Sheet)
-    except Exception as e:
-        print(f"[CẢNH BÁO] ap_cau_hinh lỗi, bỏ qua tab kiểu cũ: {type(e).__name__}: {e}", flush=True)
-    MAX_VIDEO = anh_video.ci("MAX_VIDEO") or MAX_VIDEO
-    GIOI_HAN_PHUT = anh_video.ci("GIOI_HAN_PHUT") or GIOI_HAN_PHUT
     viec = lay_viec_cho()
     print(f"Tổng cộng {len(viec)} video, làm xen kẽ giữa các tab.", flush=True)
 
@@ -737,13 +694,13 @@ def main():
             print(f"Không có giọng đọc nào dùng được, dừng sớm: {e}", flush=True)
             bi_chan_tts = True
             break
-        except Exception as e:  # lỗi bất ngờ ở 1 video không được làm sập cả lần chạy
+        except Exception as e:
             print(f"[{job['tab']}] Dòng {job['i']}: LỖI NGOÀI DỰ KIẾN {type(e).__name__}: {e}", flush=True)
         da_lam += 1
 
     print(f"Đã xử lý {da_lam} video.", flush=True)
     if bi_chan_tts:
-        sys.exit(1)   # để GitHub báo ĐỎ, không báo xanh khi chưa dựng được video nào
+        sys.exit(1)
 
 
 if __name__ == "__main__":
