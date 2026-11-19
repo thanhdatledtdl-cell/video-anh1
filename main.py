@@ -21,9 +21,13 @@ import edge_tts
 import anh_video
 
 # ==== CẤU HÌNH CHUNG ====
-SHEET_ID = "112xs-BfIZykz-zsOUhPNnXT3cNcIVDlrVBYxelrtEdA"
-DRIVE_OUTPUT_FOLDER_ID = "1OVLJi1TvnI1JL9Q7l8ApFfNH1Q8wWkTP"
-NGUON_VIDEO_NEN_ROOT_ID = "1q8dWz0BvylzeN8hD5AyeX0_2Rs-Zmfrm"
+# ID Google Sheet: là đoạn giữa /d/ và /edit trong địa chỉ Sheet.
+# Workflow (run.yml) tự truyền ID từ Apps Script qua biến SHEET_ID; nếu chạy tay thì dùng giá trị dưới đây.
+SHEET_ID = os.environ.get("SHEET_ID", "").strip() or "DAN_ID_SHEET_MOI_VAO_DAY"
+# Thư mục gốc chứa video đầu ra: tự lấy từ tab CONFIG (khoá DRIVE_OUTPUT_FOLDER_ID, do Apps Script tạo).
+# Chỉ dùng giá trị này khi tab CONFIG không có.
+DRIVE_OUTPUT_FOLDER_ID = ""
+NGUON_VIDEO_NEN_ROOT_ID = "1q8dWz0BvylzeN8hD5AyeX0_2Rs-Zmfrm"   # chỉ dùng cho kiểu video nền cũ, video ảnh không dùng
 
 # Giọng đọc (đều là edge-tts nên phụ đề vẫn khớp từng từ). Mỗi loại video có giọng riêng,
 # giọng còn lại là dự phòng. Muốn đổi giọng: sửa mục "voices" của từng tab bên dưới.
@@ -63,11 +67,14 @@ DONE = ("done", "hoàn thành", "hoan thanh")
 
 S_NGAN = 720 / 1080   # hệ số co từ mẫu 1080x1920 sang 720x1280
 
+# Hai tab dùng ẢNH: link ảnh nằm ở cột D (mỗi ô 1-5 link, cách nhau bằng xuống dòng/dấu cách/dấu phẩy)
+TAB_ANH_COT_D = ("lam_video_dai", "lam_video_ngan")
+
 # ==== MỖI TAB = 1 KIỂU VIDEO (thứ tự ở đây = thứ tự xen kẽ: dài, ngắn, dài, ngắn...) ====
-# Cột cố định: A TieuDe, B NoiDung, C LoaiDen, E LinkDrive, F Status, I Log
-# Tab lam_video_anh được thêm tự động trong main() theo tab CONFIG (xem anh_video.py)
+# Cột cố định: A TieuDe, B NoiDung, C LoaiDen, D LinkAnh, E LinkDrive, F Status, I Log
 PROFILES = {
     "lam_video_dai": dict(   # NGANG 16:9
+        kieu="anh",
         W=1280, H=720, thu_muc="Video Dai",
         voices=[GIONG_HOAI_MY, GIONG_NAM_MINH],
         vieneu_voice="Trúc Ly",      # nữ, Bắc, tự nhiên
@@ -78,6 +85,7 @@ PROFILES = {
         so_tu_cum=11,
     ),
     "lam_video_ngan": dict(  # DỌC 9:16 theo đúng mẫu SHORTS: video ngang ở giữa + nền mờ trên/dưới
+        kieu="anh",
         W=720, H=1280, thu_muc="Video Ngan",      # đổi thành W=1080, H=1920 để ra đúng kích thước mẫu
         voices=[GIONG_NAM_MINH, GIONG_HOAI_MY],
         vieneu_voice="Hải Đăng",     # nam, Bắc, tự nhiên
@@ -101,6 +109,8 @@ gc = drive_read = drive_upload = spreadsheet = None
 
 def khoi_tao():
     global gc, drive_read, drive_upload, spreadsheet
+    if SHEET_ID.startswith("DAN_ID"):
+        raise RuntimeError("Chưa điền SHEET_ID trong main.py (dòng SHEET_ID = ...). Dán ID Google Sheet mới vào.")
     sa_creds = SACredentials.from_service_account_file("service_account.json", scopes=SCOPES)
     gc = gspread.authorize(sa_creds)
     drive_read = build("drive", "v3", credentials=sa_creds)
@@ -137,8 +147,12 @@ def retry(fn, *args, tries=5, **kwargs):
 
 
 def ghi_log(ws, i, msg):
+    """Ghi lỗi: cột F = '❌ Lỗi' (để menu 'Chạy lại các dòng lỗi' nhận ra) và cột I = nội dung lỗi."""
     try:
-        retry(ws.update_cell, i, 9, msg)
+        retry(ws.batch_update, [
+            {"range": f"F{i}", "values": [["❌ Lỗi"]]},
+            {"range": f"I{i}", "values": [[msg]]},
+        ], value_input_option="USER_ENTERED")
     except Exception as e:
         print(f"Không ghi được log vào Sheet: {e}", flush=True)
 
@@ -148,6 +162,57 @@ def slugify_vi(text):
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return re.sub(r"[^a-z0-9]+", "-", text).strip("-") or "video"
+
+
+def ten_file_video(tieu_de):
+    """Tên file video = tiêu đề (bỏ ký tự cấm), giống hàm tenFile_ bên Apps Script."""
+    t = re.sub(r'[\\/:*?"<>|]+', " ", tieu_de or "")
+    t = re.sub(r"\s+", " ", t).strip()[:100]
+    return (t or "video") + ".mp4"
+
+
+def tach_link_o(o, toi_da=5):
+    """Tách 1 ô chứa nhiều link (xuống dòng / dấu cách / dấu phẩy / chấm phẩy) thành danh sách link."""
+    thay, kq = set(), []
+    for x in re.split(r"[\s,;]+", o or ""):
+        if re.match(r"^https?://", x, re.I) and x not in thay:
+            thay.add(x)
+            kq.append(x)
+    return kq[:toi_da]
+
+
+_cau_hinh_sheet = None
+
+
+def lay_cau_hinh_sheet(key):
+    """Đọc 1 giá trị trong tab CONFIG của Google Sheet (cột A = khoá, cột B = giá trị)."""
+    global _cau_hinh_sheet
+    if _cau_hinh_sheet is None:
+        _cau_hinh_sheet = {}
+        try:
+            for r in retry(spreadsheet.worksheet("CONFIG").get_all_values):
+                if len(r) >= 2 and r[0].strip():
+                    _cau_hinh_sheet[r[0].strip()] = r[1].strip()
+        except gspread.WorksheetNotFound:
+            pass
+    return _cau_hinh_sheet.get(key, "")
+
+
+_goc_id = None
+
+
+def lay_thu_muc_goc():
+    """ID thư mục gốc chứa video đầu ra (ưu tiên tab CONFIG)."""
+    global _goc_id
+    if _goc_id:
+        return _goc_id
+    fid = (lay_cau_hinh_sheet("DRIVE_OUTPUT_FOLDER_ID")
+           or os.environ.get("DRIVE_OUTPUT_FOLDER_ID", "").strip()
+           or DRIVE_OUTPUT_FOLDER_ID)
+    if not fid:
+        raise RuntimeError("Chưa có DRIVE_OUTPUT_FOLDER_ID. Chạy menu 'Cài đặt tự động' trong Google Sheet để tạo thư mục.")
+    _goc_id = fid
+    return fid
 
 
 def get_duration(path):
@@ -404,7 +469,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     print(f"[DEBUG] {len(words)} từ, {len(cums)} cụm phụ đề", flush=True)
 
 
-# ================== VIDEO NỀN ==================
+# ================== VIDEO NỀN (kiểu cũ, video ảnh không dùng) ==================
 
 def chuan_bi_video_nen(folder_id, audio_duration, i, P):
     goc = lay_danh_sach_video(folder_id)
@@ -532,7 +597,7 @@ def upload_to_drive(file_path, file_name, parent_id):
 # ================== HÀNG ĐỢI XEN KẼ ==================
 
 def lay_viec_cho():
-    """Đọc các tab, trả về danh sách việc XEN KẼ: dài, ngắn, ảnh, dài, ngắn, ảnh..."""
+    """Đọc các tab, trả về danh sách việc XEN KẼ: dài, ngắn, dài, ngắn..."""
     theo_tab = []
     for ten_tab in PROFILES:
         try:
@@ -554,7 +619,11 @@ def lay_viec_cho():
                 continue
             job = dict(tab=ten_tab, ws=ws, i=i, tieu_de=tieu_de, text=text, loai_den=loai_den)
             if kieu_anh:
-                job["anh"] = anh_video.doc_link_anh(row[9:14])
+                if ten_tab in TAB_ANH_COT_D:
+                    cac_link = tach_link_o(row[3])            # cột D: LinkAnh
+                else:
+                    cac_link = row[9:14]                      # tab ảnh kiểu cũ: cột J-N
+                job["anh"] = anh_video.doc_link_anh(cac_link)
                 if not job["anh"]:
                     continue
             ds.append(job)
@@ -608,19 +677,18 @@ def lam_1_video(job):
 
         ghep_video(audio_path, bg, ass_path, out_path, P)
 
-        if ten_tab not in cache_thu_muc_out:
-            cache_thu_muc_out[ten_tab] = retry(tim_hoac_tao_thu_muc, P["thu_muc"], DRIVE_OUTPUT_FOLDER_ID, drive_upload)
-        khoa = (ten_tab, loai_den)
-        if khoa not in cache_thu_muc_out:
-            cache_thu_muc_out[khoa] = retry(tim_hoac_tao_thu_muc, loai_den, cache_thu_muc_out[ten_tab], drive_upload)
-        link = retry(upload_to_drive, out_path, slugify_vi(tieu_de) + ".mp4", cache_thu_muc_out[khoa])
+        # Lưu vào: [thư mục gốc] / [LoaiDen] / [TieuDe].mp4   (ví dụ: Video đầu ra / Đèn đường led / ....mp4)
+        ten_thu_muc = loai_den.replace("\\", "-").replace("/", "-").strip() or "Khac"
+        if ten_thu_muc not in cache_thu_muc_out:
+            cache_thu_muc_out[ten_thu_muc] = retry(tim_hoac_tao_thu_muc, ten_thu_muc, lay_thu_muc_goc(), drive_upload)
+        link = retry(upload_to_drive, out_path, ten_file_video(tieu_de), cache_thu_muc_out[ten_thu_muc])
 
         # 1 lệnh ghi duy nhất (link + Done + xoá log) để không vượt hạn mức 60 lệnh ghi/phút
         retry(ws.batch_update, [
             {"range": f"E{i}:F{i}", "values": [[link, "Done"]]},
             {"range": f"I{i}", "values": [[""]]},
         ], value_input_option="USER_ENTERED")
-        if kieu_anh:
+        if ten_tab not in TAB_ANH_COT_D and kieu_anh:
             anh_video.ghi_nhat_ky(spreadsheet, tieu_de, len(job["anh"]), chu_ky)
         print(f"[{ten_tab}] Dòng {i}: xong -> {link}", flush=True)
     except TTSBlocked:
@@ -646,7 +714,10 @@ def main():
         pass
     khoi_tao()
     anh_video.doc_config(spreadsheet)                                   # đọc tab CONFIG
-    anh_video.ap_cau_hinh(PROFILES, GIONG_HOAI_MY, GIONG_NAM_MINH)       # thêm tab lam_video_anh theo CONFIG
+    try:
+        anh_video.ap_cau_hinh(PROFILES, GIONG_HOAI_MY, GIONG_NAM_MINH)   # tab lam_video_anh kiểu cũ (nếu có trong Sheet)
+    except Exception as e:
+        print(f"[CẢNH BÁO] ap_cau_hinh lỗi, bỏ qua tab kiểu cũ: {type(e).__name__}: {e}", flush=True)
     MAX_VIDEO = anh_video.ci("MAX_VIDEO") or MAX_VIDEO
     GIOI_HAN_PHUT = anh_video.ci("GIOI_HAN_PHUT") or GIOI_HAN_PHUT
     viec = lay_viec_cho()
