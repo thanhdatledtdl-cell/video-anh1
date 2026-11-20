@@ -784,6 +784,8 @@ def lay_viec_cho():
                 continue
             if text == "Đang tạo nội dung...":
                 continue
+            if status in DONE or status.startswith("❌"):
+                continue
             ds.append(dict(
                 tab=ten_tab, ws=ws, i=i,
                 tieu_de=tieu_de, text=text, loai_den=loai_den, links=links
