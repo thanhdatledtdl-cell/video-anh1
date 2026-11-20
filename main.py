@@ -243,12 +243,23 @@ def retry(fn, *args, tries=5, **kwargs):
             time.sleep(cho)
 
 
+def ghi_o_sheet(ws, cac_vung):
+    """Ghi nhiều vùng vào Sheet. Dùng lambda để MỖI LẦN THỬ tạo danh sách mới
+    (gspread tự sửa danh sách đầu vào, nếu dùng lại sẽ bị nối tên tab chồng lên)."""
+    def _ghi():
+        ws.batch_update(
+            [{"range": r, "values": v} for r, v in cac_vung],
+            value_input_option="USER_ENTERED",
+        )
+    retry(_ghi)
+
+
 def ghi_log(ws, i, msg):
     try:
-        retry(ws.batch_update, [
-            {"range": f"F{i}", "values": [["❌ Lỗi"]]},
-            {"range": f"I{i}", "values": [[msg]]},
-        ], value_input_option="USER_ENTERED")
+        ghi_o_sheet(ws, [
+            (f"F{i}", [["❌ Lỗi"]]),
+            (f"I{i}", [[msg]]),
+        ])
     except Exception as e:
         print(f"Không ghi được log vào Sheet: {e}", flush=True)
 
@@ -780,11 +791,12 @@ def lay_viec_cho():
             status = row[5].strip().lower()
             if status in DONE:
                 continue
+            if status.startswith("❌"):
+                # Dòng lỗi: không làm lại tự động. Muốn làm lại thì xoá ô Status (cột F).
+                continue
             if not (tieu_de and text and loai_den and links):
                 continue
             if text == "Đang tạo nội dung...":
-                continue
-            if status in DONE or status.startswith("❌"):
                 continue
             ds.append(dict(
                 tab=ten_tab, ws=ws, i=i,
@@ -831,6 +843,7 @@ def lam_1_video(job):
     ass_path = f"caption_{ten_tab}_{i}.ass"
     out_path = f"output_{ten_tab}_{i}.mp4"
     bg = None
+    link = None
     try:
         words = tao_giong_doc(text, audio_path, P["voices"], P.get("vieneu_voice", "Hải Đăng"))
         viet_phu_de(words, ass_path, P)
@@ -840,16 +853,20 @@ def lam_1_video(job):
         parent_dich = lay_thu_muc_dich_drive(ten_tab, loai_den)
         link = retry(upload_to_drive, out_path, slugify_vi(tieu_de) + ".mp4", parent_dich)
 
-        retry(ws.batch_update, [
-            {"range": f"E{i}:F{i}", "values": [[link, "Done"]]},
-            {"range": f"I{i}", "values": [[""]]},
-        ], value_input_option="USER_ENTERED")
+        ghi_o_sheet(ws, [
+            (f"E{i}:F{i}", [[link, "Done"]]),
+            (f"I{i}", [[""]]),
+        ])
         print(f"[{ten_tab}] Dòng {i}: xong ({P['thu_muc_goc']}/{loai_den}) -> {link}", flush=True)
     except TTSBlocked:
         raise
     except Exception as e:
         print(f"[{ten_tab}] Dòng {i}: LỖI {type(e).__name__}: {e}", flush=True)
-        ghi_log(ws, i, f"❌ {type(e).__name__}: {str(e)[:140]}")
+        if link:
+            # Video đã lên Drive nhưng ghi Sheet lỗi: lưu link vào log để khỏi mất, tránh dựng trùng thủ công
+            ghi_log(ws, i, f"❌ Đã tải lên Drive nhưng ghi Sheet lỗi. Link: {link} | {type(e).__name__}: {str(e)[:100]}")
+        else:
+            ghi_log(ws, i, f"❌ {type(e).__name__}: {str(e)[:140]}")
     finally:
         for p in (audio_path, ass_path, bg, out_path):
             if p and os.path.exists(p):
