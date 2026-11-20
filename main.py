@@ -2,7 +2,9 @@ import os
 import re
 import sys
 import json
+import math
 import time
+import random
 import asyncio
 import subprocess
 import urllib.request
@@ -18,12 +20,13 @@ from googleapiclient.http import MediaFileUpload
 import edge_tts
 
 # ==== CẤU HÌNH CHUNG ====
+# ID mặc định của Sheet "Làm video ảnh 1" (dùng khi bấm Run workflow trực tiếp trên GitHub)
 DEFAULT_SHEET_ID = (
     os.environ.get("SHEET_ID", "").strip()
     or "1EA0gsJYFutOI-UXgEdIhvwx90qdB1qGIuq6ukUEXqXA"
 )
 DEFAULT_DRIVE_OUTPUT_FOLDER_ID = os.environ.get("DRIVE_OUTPUT_FOLDER_ID", "").strip()
-DEFAULT_DRIVE_OUTPUT_FOLDER_NAME = os.environ.get("DRIVE_OUTPUT_FOLDER_NAME", "Video đầu ra").strip() or "Video đầu ra"
+TEN_THU_MUC_GOC = "Video đầu ra"
 
 GIONG_HOAI_MY = "vi-VN-HoaiMyNeural"
 GIONG_NAM_MINH = "vi-VN-NamMinhNeural"
@@ -54,6 +57,30 @@ MAX_ANH_MAC_DINH = 5
 DONE = ("done", "hoàn thành", "hoan thanh")
 S_NGAN = 720 / 1080
 
+# ==== HIỆU ỨNG CHUYỂN CẢNH / CHUYỂN ĐỘNG ====
+FPS = 30
+# Mỗi "cảnh" (shot) dài khoảng 6-8 giây, ảnh sẽ được lặp lại nhiều lần với chuyển động khác nhau
+SHOT_GIAY_MIN, SHOT_GIAY_MAX = 6.0, 8.0
+MAX_SHOT = 50
+# Thời gian 1 lần chuyển cảnh (giây), mỗi video chọn ngẫu nhiên trong khoảng này
+CHUYEN_CANH_MIN, CHUYEN_CANH_MAX = 0.6, 1.0
+HE_SO_ZOOM = 0.12  # phóng to tối đa 12% khi chuyển động
+
+DS_CHUYEN_CANH = [
+    "fade", "fadeblack", "fadewhite", "dissolve",
+    "wipeleft", "wiperight", "wipeup", "wipedown",
+    "slideleft", "slideright", "slideup", "slidedown",
+    "smoothleft", "smoothright", "smoothup", "smoothdown",
+    "circleopen", "circleclose", "circlecrop", "rectcrop", "radial",
+    "vertopen", "vertclose", "horzopen", "horzclose",
+    "diagtl", "diagtr", "diagbl", "diagbr",
+    "hlslice", "hrslice", "vuslice", "vdslice",
+    "squeezeh", "squeezev", "zoomin", "pixelize", "hblur",
+]
+KIEU_CHUYEN_DONG = ["in", "out", "trai_phai", "phai_trai", "tren_duoi", "duoi_tren"]
+_XFADE_HOP_LE = None
+_TRANG_THAI_HIEU_UNG = {"chuyen_cuoi": None}
+
 # ==== MỖI TAB = 1 KIỂU VIDEO & THƯ MỤC RIÊNG TRÊN DRIVE ====
 PROFILES = {
     "lam_video_dai": dict(
@@ -73,10 +100,12 @@ PROFILES = {
         voices=[GIONG_NAM_MINH, GIONG_HOAI_MY],
         vieneu_voice="Hải Đăng",
         khung_mo=True,
-        nen_w=1280, nen_h=720,
+        # Khung ảnh vuông 1:1 (hiển thị 720x720 giữa video dọc), ảnh được giữ nguyên không cắt
+        nen_w=1080, nen_h=1080,
         ten_text="Thành Đạt LED", lien_he_text=TEXT_SDT,
         mau_ten="white", mau_sdt="#FFD500",
-        sub_size=round(44 * S_NGAN), sub_margin_v=round(650 * S_NGAN), sub_margin_lr=round(60 * S_NGAN),
+        # Phụ đề nằm dưới khung ảnh, không che sản phẩm
+        sub_size=36, sub_margin_v=110, sub_margin_lr=40,
         so_tu_cum=11,
     ),
 }
@@ -89,7 +118,6 @@ SCOPES = [
 gc = drive_upload = spreadsheet = None
 SHEET_ID = DEFAULT_SHEET_ID
 DRIVE_OUTPUT_FOLDER_ID = DEFAULT_DRIVE_OUTPUT_FOLDER_ID
-DRIVE_OUTPUT_FOLDER_NAME = DEFAULT_DRIVE_OUTPUT_FOLDER_NAME
 MAX_ANH = MAX_ANH_MAC_DINH
 
 
@@ -108,7 +136,7 @@ def lay_client_payload():
 
 
 def doc_cau_hinh_sheet():
-    global DRIVE_OUTPUT_FOLDER_ID, DRIVE_OUTPUT_FOLDER_NAME, MAX_ANH
+    global DRIVE_OUTPUT_FOLDER_ID, MAX_ANH
     try:
         ws = spreadsheet.worksheet("CONFIG")
         vals = ws.get_all_values()
@@ -116,25 +144,20 @@ def doc_cau_hinh_sheet():
         for r in vals:
             if len(r) >= 2 and r[0].strip():
                 cfg[r[0].strip()] = r[1].strip()
-        if "DRIVE_OUTPUT_FOLDER_ID" in cfg:
+        if cfg.get("DRIVE_OUTPUT_FOLDER_ID"):
             DRIVE_OUTPUT_FOLDER_ID = cfg["DRIVE_OUTPUT_FOLDER_ID"]
-        if cfg.get("DRIVE_OUTPUT_FOLDER_NAME"):
-            DRIVE_OUTPUT_FOLDER_NAME = cfg["DRIVE_OUTPUT_FOLDER_NAME"]
         if cfg.get("MAX_ANH"):
             try:
-                MAX_ANH = max(1, min(10, int(cfg["MAX_ANH"])))
+                MAX_ANH = max(1, min(10, int(float(cfg["MAX_ANH"]))))
             except ValueError:
                 MAX_ANH = MAX_ANH_MAC_DINH
-        print(
-            f"[CONFIG] FOLDER_ID={DRIVE_OUTPUT_FOLDER_ID or '(tự tạo)'} | "
-            f"FOLDER_NAME={DRIVE_OUTPUT_FOLDER_NAME} | MAX_ANH={MAX_ANH}",
-            flush=True,
-        )
+        print(f"[CONFIG] Đã đọc cấu hình | FOLDER_ID={DRIVE_OUTPUT_FOLDER_ID or '(tự tạo)'} | MAX_ANH={MAX_ANH}", flush=True)
     except gspread.WorksheetNotFound:
         print("[CONFIG] Không có tab CONFIG, dùng cấu hình mặc định.", flush=True)
 
 
-def ghi_folder_id_vao_config(folder_id):
+def luu_id_thu_muc_vao_config(folder_id):
+    """Ghi (hoặc cập nhật) DRIVE_OUTPUT_FOLDER_ID vào tab CONFIG."""
     try:
         ws_cfg = spreadsheet.worksheet("CONFIG")
         vals = ws_cfg.get_all_values()
@@ -142,9 +165,9 @@ def ghi_folder_id_vao_config(folder_id):
             if r and r[0].strip() == "DRIVE_OUTPUT_FOLDER_ID":
                 ws_cfg.update_cell(idx, 2, folder_id)
                 return
-        ws_cfg.append_row(["DRIVE_OUTPUT_FOLDER_ID", folder_id, "Tự tạo theo tài khoản OAuth"])
+        ws_cfg.append_row(["DRIVE_OUTPUT_FOLDER_ID", folder_id, "Tự tạo bởi GitHub"])
     except Exception as e:
-        print(f"[CONFIG] Không ghi được DRIVE_OUTPUT_FOLDER_ID: {e}", flush=True)
+        print(f"[CONFIG] Không ghi được ID thư mục vào CONFIG: {e}", flush=True)
 
 
 def khoi_tao():
@@ -167,23 +190,39 @@ def khoi_tao():
         scopes=["https://www.googleapis.com/auth/drive"],
     )
     drive_upload = build("drive", "v3", credentials=oauth_creds)
+
+    # In ra tài khoản Drive đang dùng để dễ kiểm tra
+    try:
+        u = retry(lambda: drive_upload.about().get(fields="user(emailAddress,displayName)").execute())["user"]
+        print(f"[OAUTH] Đang dùng tài khoản Drive: {u.get('displayName')} <{u.get('emailAddress')}>", flush=True)
+    except Exception as e:
+        print(f"[OAUTH] Không đọc được tài khoản: {type(e).__name__}: {str(e)[:150]}", flush=True)
+
     spreadsheet = gc.open_by_key(SHEET_ID)
     doc_cau_hinh_sheet()
 
+    # Kiểm tra thư mục gốc có truy cập được không, nếu không thì tự tạo thư mục mới
+    can_luu_id = False
     if DRIVE_OUTPUT_FOLDER_ID:
         try:
-            drive_upload.files().get(fileId=DRIVE_OUTPUT_FOLDER_ID, fields="id").execute()
-        except Exception:
-            raise RuntimeError(
-                f"Tài khoản OAuth không truy cập được thư mục {DRIVE_OUTPUT_FOLDER_ID}. "
-                "Hãy xoá trắng DRIVE_OUTPUT_FOLDER_ID trong tab CONFIG hoặc chia sẻ thư mục cho tài khoản OAuth."
-            )
-    else:
-        DRIVE_OUTPUT_FOLDER_ID = retry(
-            tim_hoac_tao_thu_muc, DRIVE_OUTPUT_FOLDER_NAME, "root", drive_upload
-        )
-        ghi_folder_id_vao_config(DRIVE_OUTPUT_FOLDER_ID)
-        print(f"[DRIVE] Đã sẵn sàng thư mục '{DRIVE_OUTPUT_FOLDER_NAME}' (ID={DRIVE_OUTPUT_FOLDER_ID})", flush=True)
+            info = drive_upload.files().get(
+                fileId=DRIVE_OUTPUT_FOLDER_ID, fields="id,name,trashed"
+            ).execute()
+            if info.get("trashed"):
+                raise RuntimeError("thư mục đang ở thùng rác")
+            print(f"[DRIVE] Dùng thư mục gốc: {info.get('name')} ({DRIVE_OUTPUT_FOLDER_ID})", flush=True)
+        except Exception as e:
+            print(f"[DRIVE] Tài khoản OAuth KHÔNG truy cập được thư mục {DRIVE_OUTPUT_FOLDER_ID} "
+                  f"({type(e).__name__}: {str(e)[:120]}) -> tự tạo thư mục mới.", flush=True)
+            DRIVE_OUTPUT_FOLDER_ID = ""
+
+    if not DRIVE_OUTPUT_FOLDER_ID:
+        DRIVE_OUTPUT_FOLDER_ID = retry(tim_hoac_tao_thu_muc, TEN_THU_MUC_GOC, "root", drive_upload)
+        can_luu_id = True
+        print(f"[DRIVE] Thư mục gốc mới: {TEN_THU_MUC_GOC} ({DRIVE_OUTPUT_FOLDER_ID})", flush=True)
+
+    if can_luu_id:
+        luu_id_thu_muc_vao_config(DRIVE_OUTPUT_FOLDER_ID)
 
 
 # ================== TIỆN ÍCH ==================
@@ -230,12 +269,17 @@ def get_duration(path):
     return float(json.loads(r.stdout)["format"]["duration"])
 
 
+def chay_ffmpeg(cmd):
+    """Chạy ffmpeg, nếu lỗi thì báo kèm đoạn cuối thông báo lỗi của ffmpeg."""
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg lỗi: {(r.stderr or r.stdout)[-300:].strip()}")
+
+
 def tim_folder(ten, parent_id, service):
-    q = (
-        f"name = '{ten.replace(chr(39), chr(92) + chr(39))}' "
-        f"and mimeType = 'application/vnd.google-apps.folder' "
-        f"and '{parent_id}' in parents and trashed = false"
-    )
+    q = (f"name = '{ten.replace(chr(39), chr(92) + chr(39))}' "
+         f"and mimeType = 'application/vnd.google-apps.folder' "
+         f"and '{parent_id}' in parents and trashed = false")
     files = service.files().list(q=q, fields="files(id)").execute().get("files", [])
     return files[0]["id"] if files else None
 
@@ -312,10 +356,8 @@ async def _edge_tts(text, audio_path, voice):
 
 
 def tao_giong_azure(text, audio_path, voice):
-    ssml = (
-        "<speak version='1.0' xml:lang='vi-VN'><voice name='%s'>%s</voice></speak>"
-        % (voice, xml_escape(text))
-    )
+    ssml = ("<speak version='1.0' xml:lang='vi-VN'><voice name='%s'>%s</voice></speak>"
+            % (voice, xml_escape(text)))
     req = urllib.request.Request(
         f"https://{AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
         data=ssml.encode("utf-8"),
@@ -496,43 +538,149 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     print(f"[DEBUG] {len(words)} từ, {len(cums)} cụm phụ đề", flush=True)
 
 
-# ================== DỰNG VIDEO NỀN TỪ DANH SÁCH ẢNH ==================
+# ================== DỰNG VIDEO NỀN: ẢNH VỪA KHUNG + CHUYỂN CẢNH ĐA DẠNG ==================
+
+def ds_chuyen_canh_hop_le():
+    """Chỉ giữ các kiểu chuyển cảnh mà bản ffmpeg đang cài hỗ trợ."""
+    global _XFADE_HOP_LE
+    if _XFADE_HOP_LE is None:
+        ok = []
+        try:
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-h", "filter=xfade"],
+                               capture_output=True, text=True, timeout=20)
+            txt = (r.stdout or "") + (r.stderr or "")
+            ok = [t for t in DS_CHUYEN_CANH if re.search(r"\b" + t + r"\b", txt)]
+        except Exception:
+            ok = []
+        if len(ok) < 4:
+            ok = ["fade", "wipeleft", "wiperight", "slideleft", "slideright", "dissolve", "circleopen"]
+        _XFADE_HOP_LE = ok
+        print(f"[HIEU UNG] {len(ok)} kiểu chuyển cảnh khả dụng.", flush=True)
+    return _XFADE_HOP_LE
+
+
+def chon_chuyen_canh(so_chuyen):
+    """Mỗi video chọn ngẫu nhiên một 'bộ' 6-10 kiểu, không lặp liên tiếp, không trùng đầu với video trước."""
+    pool = ds_chuyen_canh_hop_le()
+    bo = random.sample(pool, k=min(len(pool), random.randint(6, 10)))
+    seq, truoc = [], _TRANG_THAI_HIEU_UNG["chuyen_cuoi"]
+    for _ in range(so_chuyen):
+        ung_vien = [t for t in bo if t != truoc] or bo
+        t = random.choice(ung_vien)
+        seq.append(t)
+        truoc = t
+    _TRANG_THAI_HIEU_UNG["chuyen_cuoi"] = truoc
+    return seq
+
+
+def bieu_thuc_chuyen_dong(kieu, so_khung):
+    """Trả về (z, x, y) cho filter zoompan (hiệu ứng Ken Burns)."""
+    z_max = 1 + HE_SO_ZOOM
+    n = max(so_khung - 1, 1)
+    cx = "iw/2-(iw/zoom/2)"
+    cy = "ih/2-(ih/zoom/2)"
+    if kieu == "in":
+        return f"min(1+{HE_SO_ZOOM}*on/{n},{z_max})", cx, cy
+    if kieu == "out":
+        return f"max({z_max}-{HE_SO_ZOOM}*on/{n},1)", cx, cy
+    if kieu == "trai_phai":
+        return f"{z_max}", f"(iw-iw/zoom)*on/{n}", cy
+    if kieu == "phai_trai":
+        return f"{z_max}", f"(iw-iw/zoom)*(1-on/{n})", cy
+    if kieu == "tren_duoi":
+        return f"{z_max}", cx, f"(ih-ih/zoom)*on/{n}"
+    return f"{z_max}", cx, f"(ih-ih/zoom)*(1-on/{n})"  # duoi_tren
+
+
+def ghep_anh_vua_khung(raw_path, out_png, W, H):
+    """Giữ NGUYÊN toàn bộ ảnh (không cắt), phần thừa được lấp bằng nền mờ chính ảnh đó."""
+    w8, h8 = max(2, W // 8), max(2, H // 8)
+    fc = (
+        f"[0:v]split=2[a][b];"
+        f"[a]scale={w8}:{h8}:force_original_aspect_ratio=increase,crop={w8}:{h8},"
+        f"gblur=sigma=4,scale={W}:{H},eq=brightness=-0.08[bg];"
+        f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,format=rgb24[o]"
+    )
+    chay_ffmpeg(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", raw_path,
+                 "-filter_complex", fc, "-map", "[o]", "-frames:v", "1", out_png])
+
 
 def chuan_bi_video_nen_tu_anh(links, audio_duration, tag, P):
     W, H = P.get("nen_w", P["W"]), P.get("nen_h", P["H"])
-    img_paths = []
+    file_tam = []
     try:
+        # 1) Tải ảnh và dựng khung vừa kích thước (không cắt ảnh), ảnh lỗi thì bỏ qua
+        comps = []
         for idx, url in enumerate(links):
-            p = f"img_{tag}_{idx}"
-            tai_anh_ve(url, p)
-            img_paths.append(p)
+            raw = f"img_{tag}_{idx}"
+            comp = f"comp_{tag}_{idx}.png"
+            file_tam += [raw, comp]
+            try:
+                tai_anh_ve(url, raw)
+                ghep_anh_vua_khung(raw, comp, W, H)
+                comps.append(comp)
+            except Exception as e:
+                print(f"[ANH] Bỏ qua ảnh {idx + 1} ({url[:70]}): {type(e).__name__}: {str(e)[:120]}", flush=True)
+        if not comps:
+            raise RuntimeError("Không xử lý được ảnh nào trong danh sách link")
 
-        n = len(img_paths)
-        dur_moi_anh = max(2.0, audio_duration / n)
-        total_dur = dur_moi_anh * n
-        while total_dur < audio_duration + 1.0:
-            dur_moi_anh += 0.5
-            total_dur = dur_moi_anh * n
+        # 2) Tính số cảnh và độ dài mỗi cảnh (ảnh lặp lại với chuyển động khác nhau)
+        n = len(comps)
+        t = round(random.uniform(CHUYEN_CANH_MIN, CHUYEN_CANH_MAX), 2)
+        shot_giay = random.uniform(SHOT_GIAY_MIN, SHOT_GIAY_MAX)
+        m = min(max(n, math.ceil(audio_duration / shot_giay)), MAX_SHOT)
+        d = (audio_duration + 1.0 + (m - 1) * t) / m
+        d = max(d, 2 * t + 0.6, 2.5)
+        so_khung = int(round(d * FPS))
+        d = so_khung / FPS
 
-        parts = []
-        for j in range(n):
-            parts.append(
-                f"[{j}:v]loop=loop=-1:size=1:start=0,trim=duration={dur_moi_anh:.3f},setpts=PTS-STARTPTS,"
-                f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30[v{j}]"
-            )
-        parts.append("".join(f"[v{j}]" for j in range(n)) + f"concat=n={n}:v=1:a=0[bgv]")
+        # 3) Mỗi cảnh = 1 ảnh + 1 kiểu chuyển động (phóng to/thu nhỏ/lướt trái-phải-trên-dưới)
+        clips, truoc = [], None
+        for k in range(m):
+            comp = comps[k % n]
+            kieu = random.choice([x for x in KIEU_CHUYEN_DONG if x != truoc])
+            truoc = kieu
+            z, x, y = bieu_thuc_chuyen_dong(kieu, so_khung)
+            clip = f"shot_{tag}_{k}.mp4"
+            clips.append(clip)
+            file_tam.append(clip)
+            vf = (f"scale={int(W * 1.5)}:{int(H * 1.5)},"
+                  f"zoompan=z='{z}':x='{x}':y='{y}':d={so_khung}:s={W}x{H}:fps={FPS},"
+                  f"setsar=1,format=yuv420p")
+            chay_ffmpeg(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", comp,
+                         "-vf", vf, "-frames:v", str(so_khung),
+                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", clip])
 
+        # 4) Nối các cảnh bằng chuyển cảnh ngẫu nhiên
         out = f"bgimg_{tag}.mp4"
+        if m == 1:
+            os.replace(clips[0], out)
+            file_tam.remove(clips[0])
+            return out
+
+        seq = chon_chuyen_canh(m - 1)
+        parts, prev = [], "[0:v]"
+        for k in range(1, m):
+            nhan = "[bgv]" if k == m - 1 else f"[x{k}]"
+            parts.append(
+                f"{prev}[{k}:v]xfade=transition={seq[k - 1]}:duration={t}:offset={k * (d - t):.3f}{nhan}"
+            )
+            prev = nhan
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-        for p in img_paths:
-            cmd += ["-i", p]
+        for c in clips:
+            cmd += ["-i", c]
         cmd += ["-filter_complex", ";".join(parts), "-map", "[bgv]", "-an",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out]
-        subprocess.run(cmd, check=True)
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", out]
+        chay_ffmpeg(cmd)
+        dem = {}
+        for s in seq:
+            dem[s] = dem.get(s, 0) + 1
+        print(f"[HIEU UNG] {m} cảnh x {d:.1f}s, chuyển cảnh {t}s, kiểu dùng: {dem}", flush=True)
         return out
     finally:
-        for p in img_paths:
-            if os.path.exists(p):
+        for p in file_tam:
+            if p and os.path.exists(p):
                 os.remove(p)
 
 
@@ -588,7 +736,7 @@ def ghep_video(audio_path, background_video, ass_path, out_path, P):
     ass_esc = ass_abs.replace(":", r"\:")
 
     fc = filter_video_ngan(P, ass_esc) if P.get("khung_mo") else filter_video_dai(P, ass_esc)
-    subprocess.run([
+    chay_ffmpeg([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", background_video, "-i", LOGO_PATH, "-i", audio_path,
         "-filter_complex", fc,
@@ -596,7 +744,7 @@ def ghep_video(audio_path, background_video, ass_path, out_path, P):
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-pix_fmt", "yuv420p", "-c:a", "aac",
         "-shortest", out_path,
-    ], check=True)
+    ])
 
 
 def upload_to_drive(file_path, file_name, parent_id):
