@@ -23,6 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Cai ffmpeg va font
         run: |
@@ -45,3 +46,7 @@ jobs:
           # Khi Apps Script gui: lay ID Sheet tu payload. Chay tay thi de trong, main.py dung SHEET_ID ghi san trong file.
           SHEET_ID: ${{ github.event.client_payload.sheet_id }}
         run: python main.py
+
+      - name: Xoa service_account.json
+        if: always()
+        run: rm -f service_account.json
